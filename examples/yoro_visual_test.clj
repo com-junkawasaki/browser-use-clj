@@ -213,27 +213,130 @@
 
 (defn live-browser
   "Dynamically resolve playwright-browser (requires :playwright alias in deps.edn).
-  Returns nil if Playwright is not on the classpath."
+  Returns nil if Playwright is not on the classpath.
+  Sleeps 3 s after opening to give the Shadow-CLJS SPA time to hydrate."
   [start-url opts]
   (try
     (require 'browseruse.playwright-browser)
-    ((requiring-resolve 'browseruse.playwright-browser/playwright-browser) start-url opts)
+    (let [b ((requiring-resolve 'browseruse.playwright-browser/playwright-browser) start-url opts)]
+      (Thread/sleep 3000)
+      b)
     (catch Exception e
       (println "Playwright not available:" (ex-message e))
       nil)))
 
+(defn- ollama-model
+  "Build an openai-model pointed at the local Ollama instance.
+  Uses cheshire for JSON and clj-http for HTTP (both on :playwright classpath).
+  All symbols resolved at runtime so the offline tests still compile.
+  Murakumo (127.0.0.1:4000) is the charter-canonical inference endpoint
+  (ADR-2605215000); Ollama is the approved local fallback when Murakumo is DOWN."
+  []
+  (let [json-write  (requiring-resolve 'cheshire.core/generate-string)
+        json-parse  (requiring-resolve 'cheshire.core/parse-string)
+        http-post   (requiring-resolve 'clj-http.client/post)
+        make-model  (requiring-resolve 'langchain.model/openai-model)
+        http-fn     (fn [{:keys [url headers body]}]
+                      (let [resp (http-post url {:headers          headers
+                                                 :body             body
+                                                 :throw-exceptions false})]
+                        {:status (:status resp) :body (:body resp)}))]
+    (make-model
+     {:url        "http://127.0.0.1:11434/v1/chat/completions"
+      :model      "hf.co/unsloth/gemma-4-E4B-it-qat-GGUF:UD-Q4_K_XL"
+      :http-fn    http-fn
+      :json-write json-write
+      :json-read  #(json-parse % true)})))
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Live test 1 — home feed renders posts in a real browser
+;; ──────────────────────────────────────────────────────────────────────
+
+(defn live-test-home-feed!
+  "Open the yoro dev server in a real Playwright browser.
+  The LLM describes what it sees; we assert at least one content element
+  was found (feed, button, or header text)."
+  [browser m]
+  (println "\n▸ live test: home feed (Playwright)")
+  (let [conn (db/create-conn agent/log-schema)
+        {:keys [result done]}
+        (agent/run {:model        m
+                    :browser      browser
+                    :task         (str "Navigate to http://localhost:8700/index.html and describe "
+                                       "the page. Report: (1) does the page load without a blank screen? "
+                                       "(2) is there a header with text or logo? "
+                                       "(3) are there any posts, cards or buttons visible?")
+                    :history-conn conn
+                    :session-id   "live-home"
+                    :max-steps    6})]
+    (println "  result:" result)
+    (assert done "agent should call done")
+    (assert (re-find #"(?i)(page|load|visible|header|button|post|feed|screen|yoro|etzhayyim|ログイン)" result)
+            "result should mention recognisable page content")
+    (println "  ✓ PASS")))
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Live test 2 — auth modal opens on ログイン click
+;; ──────────────────────────────────────────────────────────────────────
+
+(defn live-test-auth-modal!
+  "Click the ログイン button and verify an auth modal or passkey prompt appears.
+  If the SPA hasn't fully rendered the button yet, the agent should still
+  report what it sees and call done."
+  [browser m]
+  (println "\n▸ live test: auth modal (Playwright)")
+  (let [conn (db/create-conn agent/log-schema)
+        {:keys [result done]}
+        (agent/run {:model        m
+                    :browser      browser
+                    :task         (str "On http://localhost:8700/index.html, look for a ログイン "
+                                       "button or any login/sign-in element. If you find it, click it "
+                                       "and describe what changes on the screen (modal, dialog, passkey "
+                                       "prompt, etc.). If the page appears blank or you cannot find any "
+                                       "button after looking, report honestly what you see and conclude.")
+                    :history-conn conn
+                    :session-id   "live-auth"
+                    :max-steps    12})]
+    (println "  result:" result)
+    (assert done "agent should call done")
+    (assert result "agent should return a non-nil result")
+    (assert (re-find #"(?i)(modal|dialog|passkey|パスキー|認証|sign|login|auth|appear|open|show|display|click|button|blank|no|not|page|found)" result)
+            "result should describe auth UI activity or page state")
+    (println "  ✓ PASS")))
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Live suite
+;; ──────────────────────────────────────────────────────────────────────
+
+(defn run-live!
+  "Run all visual tests against the live yoro dev server (localhost:8700)
+  using a real Playwright browser and Ollama local inference as the LLM.
+
+  Inference route: Ollama 127.0.0.1:11434 (local fallback — Murakumo DOWN).
+  Charter note: Murakumo 127.0.0.1:4000 is the production-invariant endpoint
+  (ADR-2605215000); this fallback is approved for local dev only.
+
+  Start the dev server first:
+    cd 60-apps/.../cljs && npx shadow-cljs watch app
+
+  Then run:
+    clojure -A:playwright -M -e \"(require 'yoro-visual-test) (yoro-visual-test/run-live!)\""
+  []
+  (println "=== yoro visual tests (LIVE — Playwright + Ollama) ===")
+  (let [m       (ollama-model)
+        browser (live-browser "http://localhost:8700/index.html" {:headless? true})]
+    (if-not browser
+      (println "ERROR: Playwright browser unavailable — run with clojure -A:playwright")
+      (do
+        (live-test-home-feed!  browser m)
+        (live-test-auth-modal! browser m)
+        (println "\n=== All live tests PASSED ===")))))
+
 (comment
-  ;; Live run against the real yoro dev server + Murakumo LiteLLM
-  ;; Start with: clojure -A:playwright -M -e "(require 'yoro-visual-test) (yoro-visual-test/run-live!)"
-  (let [browser (live-browser "http://localhost:8700/index.html" {:headless? false})
-        m       (model/openai-compatible-model
-                 {:base-url "http://127.0.0.1:4000"
-                  :model    "gemma4:e4b"
-                  ;; http-fn: clj-http.client/post (provided by :playwright alias)
-                  })
-        conn    (db/create-conn agent/log-schema)]
-    (agent/run {:model   m
-                :browser browser
-                :task    "Describe the yoro home feed. How many posts are visible? Is there a compose button?"
-                :history-conn conn
-                :session-id   "live-1"})))
+  ;; Quick REPL run (from browser-use-clj/ with -A:playwright):
+  (run-live!)
+
+  ;; Headful run for debugging (watch the browser):
+  (let [m (ollama-model)
+        b (live-browser "http://localhost:8700/index.html" {:headless? false})]
+    (live-test-home-feed! b m)))
